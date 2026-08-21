@@ -5,14 +5,15 @@ scraper_redesuperpopular.py — Scraper for Rede Super Popular
 Platform  : Fbits / Wake.
 Discovery : /sitemap.xml — a flat urlset (~26k URLs); product URLs contain
             "/produto/" (~26,022 of them).
-Per page  : a JSON-LD Product block (parses cleanly with json.loads) carries:
-                name                  -> product_name
-                gtin13                -> ean / barcode (13-digit EAN, GS1)
-                sku                   -> internal product id (product_id)
-                offers.price          -> regular price (BRL; no promo/list field)
-                offers.availability   -> is_available (schema.org InStock)
-                brand.name            -> brand
-                image[0]              -> image_url (often empty)
+Per page  : a JSON-LD Product block carries name, gtin13 (EAN), sku,
+            offers.price (the SELLING price), offers.availability, brand, image.
+            The block often has unescaped quotes/HTML + raw control chars in its
+            `description`, so fields are pulled with regex, NOT json.loads.
+Promo     : the de/por is NOT in the JSON-LD — it lives in the GA4 dataLayer item
+            (`price` = list price, `discount` = amount off; list - discount ==
+            the JSON-LD sell price). ~42% of products are on promo. So:
+                regular_price = dataLayer price (when discount > 0), else sell
+                promo_price   = JSON-LD offers.price (the sell price) when on promo
 EAN       : first-class (`gtin13`); no enrichment needed.
 
 Large catalogue (~26k) fetched with a thread pool (one request per product).
@@ -50,6 +51,17 @@ BROWSER_UA = (
 
 _RE_LOC     = re.compile(r'<loc>\s*([^<\s]+)\s*</loc>')
 _RE_LDBLOCK = re.compile(r'<script[^>]*ld\+json[^>]*>(.*?)</script>', re.S | re.I)
+
+# The Product JSON-LD often has unescaped quotes/HTML + raw control chars in its
+# `description`, so json.loads can't parse it — pull fields with targeted regexes
+# (all the fields we need sit outside `description`). Same approach as Campea.
+_RE_NAME  = re.compile(r'"name"\s*:\s*"([^"]*)"')
+_RE_GTIN  = re.compile(r'"gtin13"\s*:\s*"(\d{8,14})"')
+_RE_SKU   = re.compile(r'"sku"\s*:\s*"([^"]*)"')
+_RE_PRICE = re.compile(r'"price"\s*:\s*"([\d.]+)"')
+_RE_AVAIL = re.compile(r'"availability"\s*:\s*"([^"]+)"')
+_RE_BRAND = re.compile(r'"brand"\s*:\s*\{[^}]*?"name"\s*:\s*"([^"]+)"')
+_RE_IMG   = re.compile(r'"image"\s*:\s*\[\s*"([^"]+)"')
 
 
 def _make_session() -> requests.Session:
@@ -114,44 +126,62 @@ def _to_float(v: Any) -> Optional[float]:
         return None
 
 
-def _product_node(html: str) -> Optional[Dict]:
+def _dl_list_discount(html: str, url: str) -> "tuple[Optional[float], Optional[float]]":
+    """Promos are NOT in the JSON-LD — they live in the GA4 dataLayer item, whose
+    `price` is the LIST price and `discount` the amount off (list - discount ==
+    the JSON-LD sell price). Match the MAIN product's item by the URL's trailing
+    id to avoid picking up related-product items."""
+    m = re.search(r'-(\d+)/?$', url.rstrip("/"))
+    if not m:
+        return None, None
+    item = re.search(r'\{item_id:' + re.escape(m.group(1)) + r'\b[^}]*\}', html)
+    if not item:
+        return None, None
+    blk = item.group(0)
+    p = re.search(r'(?:^|,)\s*price:([\d.]+)', blk)
+    d = re.search(r'(?:^|,)\s*discount:([\d.]+)', blk)
+    return (_to_float(p.group(1)) if p else None,
+            _to_float(d.group(1)) if d else None)
+
+
+def _product_block(html: str) -> str:
+    """Return the JSON-LD <script> text holding the Product (has "Product")."""
     for blk in _RE_LDBLOCK.findall(html):
-        if '"Product"' not in blk:
-            continue
-        try:
-            d = json.loads(blk)
-        except ValueError:
-            continue
-        if isinstance(d, dict) and d.get("@type") == "Product":
-            return d
-    return None
+        if '"Product"' in blk:
+            return blk
+    return ""
+
+
+def _first(rx: "re.Pattern", s: str) -> str:
+    m = rx.search(s)
+    return m.group(1).strip() if m else ""
 
 
 def _standardize(url: str, html: str) -> Optional[Dict]:
-    p = _product_node(html)
-    if not p:
+    blk = _product_block(html)
+    if not blk:
         return None
-    name = str(p.get("name") or "").strip()
-    gtin = str(p.get("gtin13") or p.get("gtin") or "").strip()
+    name = _first(_RE_NAME, blk)      # first "name" in the block = product name
+    gtin = _first(_RE_GTIN, blk)
     if not name:
         return None
 
-    offers = p.get("offers") or {}
-    if isinstance(offers, list):
-        offers = offers[0] if offers else {}
-    regular = _to_float(offers.get("price"))
-    if regular is None or regular <= 0:
+    sell = _to_float(_first(_RE_PRICE, blk))   # JSON-LD price = actual selling price
+    if sell is None or sell <= 0:
         return None
 
-    available = "instock" in str(offers.get("availability") or "").lower()
+    # Fold in the promo (de/por) from the dataLayer (not in the JSON-LD).
+    list_price, discount = _dl_list_discount(html, url)
+    if list_price and discount and discount > 0 and list_price > sell:
+        regular, promo_price = list_price, sell
+        discount_pct = round((1 - promo_price / regular) * 100, 1)
+    else:
+        regular, promo_price, discount_pct = sell, None, None
 
-    brand = p.get("brand")
-    brand = str(brand.get("name") or "") if isinstance(brand, dict) else str(brand or "")
-
-    image = p.get("image")
-    image = image[0] if isinstance(image, list) and image else (image if isinstance(image, str) else "")
-
-    sku = str(p.get("sku") or "").strip()
+    available = "instock" in _first(_RE_AVAIL, blk).lower()
+    brand = _first(_RE_BRAND, blk)
+    image = _first(_RE_IMG, blk)
+    sku = _first(_RE_SKU, blk)
     product_id = sku or url.rstrip("/").rsplit("-", 1)[-1]
 
     return {
@@ -162,13 +192,13 @@ def _standardize(url: str, html: str) -> Optional[Dict]:
         "category_path": "",
         "ean":           gtin,
         "regular_price": regular,
-        "promo_price":   None,
-        "discount_pct":  None,
+        "promo_price":   promo_price,
+        "discount_pct":  discount_pct,
         "unit":          "",
         "is_available":  available,
         "stock":         None,
         "offer_tag":     "",
-        "is_discounted": False,
+        "is_discounted": promo_price is not None,
         "product_url":   url,
         "image_url":     str(image).strip(),
         "scraped_at":    datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
